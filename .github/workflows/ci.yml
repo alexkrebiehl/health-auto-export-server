@@ -1,0 +1,225 @@
+# CI: compile the server, then build, smoke-test and publish its container image.
+#
+# Every pull request compiles the TypeScript and builds the image for both
+# architectures, then starts it against a throwaway MongoDB to prove it
+# connects and enforces its tokens. Nothing is pushed for a pull request.
+#
+# Pushes to main and v* tags also publish a multi-arch image to the GitHub
+# Container Registry of whichever repository runs this workflow
+# (ghcr.io/<owner>/<repo>), using the built-in GITHUB_TOKEN.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Compile
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: server/.nvmrc
+          cache: yarn
+          cache-dependency-path: server/yarn.lock
+
+      - run: yarn install --frozen-lockfile
+      - run: yarn build
+
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: build
+    # Each architecture builds natively rather than under QEMU emulation.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # GHCR rejects upper-case repository names, and an owner may have them.
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: server
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          tags: hae-server:ci
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      # The server exits when it cannot reach MongoDB, so a running server that
+      # answers proves the connection. The token checks prove the read and write
+      # routes are guarded.
+      - name: Smoke test
+        env:
+          MONGO_PASSWORD: cionlynotasecret
+          READ_TOKEN: sk-ci-read-token
+          WRITE_TOKEN: sk-ci-write-token
+        run: |
+          set -euo pipefail
+          docker network create hae-ci
+          docker run -d --name hae-ci-mongo --network hae-ci \
+            -e MONGO_INITDB_ROOT_USERNAME=admin -e MONGO_INITDB_ROOT_PASSWORD="$MONGO_PASSWORD" \
+            mongo:8.2
+          for _ in $(seq 1 30); do
+            docker exec hae-ci-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+          docker run -d --name hae-ci-server --network hae-ci -p 3001:3001 \
+            -e NODE_ENV=production -e MONGO_HOST=hae-ci-mongo -e MONGO_PORT=27017 \
+            -e MONGO_DB=health-auto-export -e MONGO_USERNAME=admin -e MONGO_PASSWORD="$MONGO_PASSWORD" \
+            -e READ_TOKEN="$READ_TOKEN" -e WRITE_TOKEN="$WRITE_TOKEN" \
+            hae-server:ci
+
+          fail() {
+            echo "::error::$1"
+            docker logs hae-ci-server || true
+            docker logs hae-ci-mongo | tail -50 || true
+            exit 1
+          }
+
+          up=false
+          for _ in $(seq 1 30); do
+            if docker logs hae-ci-server 2>&1 | grep -q 'Connected successfully'; then up=true; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' hae-ci-server)" != true ]; then break; fi
+            sleep 2
+          done
+          [ "$up" = true ] || fail "The server did not connect to MongoDB"
+
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          [ "$(code http://127.0.0.1:3001/)" = 200 ] || fail "GET / did not answer 200"
+          [ "$(code http://127.0.0.1:3001/api/metrics/step_count)" = 401 ] || fail "Metrics answered without a token"
+          [ "$(code -H "api-key: $READ_TOKEN" http://127.0.0.1:3001/api/metrics/step_count)" = 200 ] || fail "Metrics refused the read token"
+          [ "$(code -X POST -H "api-key: $READ_TOKEN" -H 'content-type: application/json' -d '{}' http://127.0.0.1:3001/api/data)" = 401 ] || fail "Ingest accepted the read token"
+          echo "Smoke test passed"
+          docker logs hae-ci-server
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same inputs and cache as the build above, so this is a cache hit. The
+      # platform image is pushed by digest only; the publish job names it.
+      - name: Push by digest
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: server
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-arch image
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # main → :main and :sha-<short>; tag v1.2.3 → :1.2.3, :1.2, :latest and
+      # :sha-<short>. `latest` follows releases, not every merge.
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Create manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          mapfile -t tags < <(jq -r '.tags[] | "--tag=" + .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          sources=()
+          for digest in *; do sources+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
